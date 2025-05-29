@@ -1,0 +1,261 @@
+-- ===================================================================
+-- GUIDA COMPLETA AL MONITORAGGIO DEGLI INDICI
+-- ===================================================================
+
+-- ===================================================================
+-- 1. SCRIPT BASE PER ANALISI USO INDICI
+-- ===================================================================
+
+SELECT 
+    OBJECT_NAME(i.object_id) AS TableName,
+    i.name AS IndexName,
+    i.type_desc AS IndexType,
+    -- Statistiche di utilizzo per lettura
+    ISNULL(s.user_seeks, 0) AS UserSeeks,
+    ISNULL(s.user_scans, 0) AS UserScans, 
+    ISNULL(s.user_lookups, 0) AS UserLookups,
+    -- Statistiche di utilizzo per scrittura
+    ISNULL(s.user_updates, 0) AS UserUpdates,
+    -- Date ultimo utilizzo
+    s.last_user_seek,
+    s.last_user_scan,
+    s.last_user_lookup,
+    s.last_user_update,
+    -- Calcoli derivati
+    (ISNULL(s.user_seeks, 0) + ISNULL(s.user_scans, 0) + ISNULL(s.user_lookups, 0)) AS TotalReads,
+    -- Rapporto letture/scritture
+    CASE 
+        WHEN ISNULL(s.user_updates, 0) = 0 THEN 'NO_WRITES'
+        WHEN (ISNULL(s.user_seeks, 0) + ISNULL(s.user_scans, 0) + ISNULL(s.user_lookups, 0)) = 0 THEN 'WRITE_ONLY'
+        ELSE CAST(ROUND(
+            CAST((ISNULL(s.user_seeks, 0) + ISNULL(s.user_scans, 0) + ISNULL(s.user_lookups, 0)) AS FLOAT) / 
+            CAST(ISNULL(s.user_updates, 0) AS FLOAT), 2) AS VARCHAR(10))
+    END AS ReadWriteRatio,
+    -- Classificazione indice
+    CASE 
+        WHEN (ISNULL(s.user_seeks, 0) + ISNULL(s.user_scans, 0) + ISNULL(s.user_lookups, 0)) = 0 THEN 'UNUSED'
+        WHEN ISNULL(s.user_updates, 0) > (ISNULL(s.user_seeks, 0) + ISNULL(s.user_scans, 0) + ISNULL(s.user_lookups, 0)) * 5 THEN 'HIGH_MAINTENANCE'
+        WHEN (ISNULL(s.user_seeks, 0) + ISNULL(s.user_scans, 0) + ISNULL(s.user_lookups, 0)) > 1000 THEN 'VERY_ACTIVE'
+        WHEN (ISNULL(s.user_seeks, 0) + ISNULL(s.user_scans, 0) + ISNULL(s.user_lookups, 0)) > 100 THEN 'ACTIVE'
+        ELSE 'LOW_USAGE'
+    END AS IndexStatus,
+    -- Dimensione indice
+    CAST(ps.avg_record_size_in_bytes AS INT) AS AvgRecordSize,
+    ps.record_count AS RecordCount,
+    CAST((ps.avg_record_size_in_bytes * ps.record_count) / 1024.0 / 1024.0 AS DECIMAL(10,2)) AS IndexSizeMB
+FROM sys.indexes i
+LEFT JOIN sys.dm_db_index_usage_stats s ON i.object_id = s.object_id AND i.index_id = s.index_id AND s.database_id = DB_ID()
+LEFT JOIN sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, 'SAMPLED') ps ON i.object_id = ps.object_id AND i.index_id = ps.index_id
+WHERE i.object_id = OBJECT_ID('dbo.ov_shopfloorctl')
+    AND i.type_desc = 'NONCLUSTERED'
+    AND i.is_disabled = 0
+ORDER BY TotalReads DESC, UserUpdates DESC;
+
+-- ===================================================================
+-- 2. ANALISI DETTAGLIATA PER CATEGORIA
+-- ===================================================================
+
+-- 2.1 Indici Inutilizzati (Candidati per Rimozione)
+SELECT 
+    'UNUSED INDEXES' AS Category,
+    i.name AS IndexName,
+    CAST((ps.avg_record_size_in_bytes * ps.record_count) / 1024.0 / 1024.0 AS DECIMAL(10,2)) AS SizeMB,
+    ISNULL(s.user_updates, 0) AS OnlyUpdates,
+    'DROP INDEX [' + i.name + '] ON [dbo].[ov_shopfloorctl];' AS DropScript
+FROM sys.indexes i
+LEFT JOIN sys.dm_db_index_usage_stats s ON i.object_id = s.object_id AND i.index_id = s.index_id AND s.database_id = DB_ID()
+LEFT JOIN sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, 'SAMPLED') ps ON i.object_id = ps.object_id AND i.index_id = ps.index_id
+WHERE i.object_id = OBJECT_ID('dbo.ov_shopfloorctl')
+    AND i.type_desc = 'NONCLUSTERED'
+    AND i.is_disabled = 0
+    AND (ISNULL(s.user_seeks, 0) + ISNULL(s.user_scans, 0) + ISNULL(s.user_lookups, 0)) = 0
+ORDER BY SizeMB DESC;
+
+-- 2.2 Indici con Alto Costo di Manutenzione
+SELECT 
+    'HIGH MAINTENANCE' AS Category,
+    i.name AS IndexName,
+    ISNULL(s.user_updates, 0) AS Updates,
+    (ISNULL(s.user_seeks, 0) + ISNULL(s.user_scans, 0) + ISNULL(s.user_lookups, 0)) AS Reads,
+    CAST(ISNULL(s.user_updates, 0) / 
+         CAST(NULLIF((ISNULL(s.user_seeks, 0) + ISNULL(s.user_scans, 0) + ISNULL(s.user_lookups, 0)), 0) AS FLOAT) 
+         AS DECIMAL(5,2)) AS UpdateReadRatio,
+    CAST((ps.avg_record_size_in_bytes * ps.record_count) / 1024.0 / 1024.0 AS DECIMAL(10,2)) AS SizeMB
+FROM sys.indexes i
+LEFT JOIN sys.dm_db_index_usage_stats s ON i.object_id = s.object_id AND i.index_id = s.index_id AND s.database_id = DB_ID()
+LEFT JOIN sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, 'SAMPLED') ps ON i.object_id = ps.object_id AND i.index_id = ps.index_id
+WHERE i.object_id = OBJECT_ID('dbo.ov_shopfloorctl')
+    AND i.type_desc = 'NONCLUSTERED'
+    AND i.is_disabled = 0
+    AND ISNULL(s.user_updates, 0) > (ISNULL(s.user_seeks, 0) + ISNULL(s.user_scans, 0) + ISNULL(s.user_lookups, 0)) * 3
+ORDER BY UpdateReadRatio DESC;
+
+-- 2.3 Indici Duplicati/Ridondanti (Analisi Strutturale)
+WITH IndexColumns AS (
+    SELECT 
+        i.object_id,
+        i.index_id,
+        i.name AS IndexName,
+        STRING_AGG(c.name, ', ') WITHIN GROUP (ORDER BY ic.key_ordinal) AS KeyColumns,
+        STRING_AGG(
+            CASE WHEN ic.is_included_column = 1 THEN c.name END, ', '
+        ) WITHIN GROUP (ORDER BY ic.key_ordinal) AS IncludedColumns
+    FROM sys.indexes i
+    INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+    INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+    WHERE i.object_id = OBJECT_ID('dbo.ov_shopfloorctl')
+        AND i.type_desc = 'NONCLUSTERED'
+    GROUP BY i.object_id, i.index_id, i.name
+)
+SELECT 
+    'POTENTIAL DUPLICATES' AS Category,
+    ic1.IndexName AS Index1,
+    ic2.IndexName AS Index2,
+    ic1.KeyColumns AS KeyColumns1,
+    ic2.KeyColumns AS KeyColumns2,
+    CASE 
+        WHEN ic1.KeyColumns = ic2.KeyColumns THEN 'EXACT_DUPLICATE'
+        WHEN ic1.KeyColumns LIKE ic2.KeyColumns + '%' OR ic2.KeyColumns LIKE ic1.KeyColumns + '%' THEN 'SUBSET'
+        ELSE 'SIMILAR'
+    END AS DuplicateType
+FROM IndexColumns ic1
+CROSS JOIN IndexColumns ic2
+WHERE ic1.index_id < ic2.index_id
+    AND (ic1.KeyColumns = ic2.KeyColumns 
+         OR ic1.KeyColumns LIKE ic2.KeyColumns + '%' 
+         OR ic2.KeyColumns LIKE ic1.KeyColumns + '%')
+ORDER BY DuplicateType, ic1.IndexName;
+
+-- ===================================================================
+-- 3. ANALISI FRAMMENTAZIONE
+-- ===================================================================
+
+SELECT 
+    i.name AS IndexName,
+    ps.avg_fragmentation_in_percent AS FragmentationPercent,
+    ps.page_count AS PageCount,
+    CASE 
+        WHEN ps.avg_fragmentation_in_percent > 30 THEN 'REBUILD'
+        WHEN ps.avg_fragmentation_in_percent > 10 THEN 'REORGANIZE'
+        ELSE 'GOOD'
+    END AS MaintenanceAction,
+    -- Script di manutenzione
+    CASE 
+        WHEN ps.avg_fragmentation_in_percent > 30 THEN 
+            'ALTER INDEX [' + i.name + '] ON [dbo].[ov_shopfloorctl] REBUILD WITH (FILLFACTOR = 85);'
+        WHEN ps.avg_fragmentation_in_percent > 10 THEN 
+            'ALTER INDEX [' + i.name + '] ON [dbo].[ov_shopfloorctl] REORGANIZE;'
+        ELSE 'NO ACTION NEEDED'
+    END AS MaintenanceScript
+FROM sys.indexes i
+INNER JOIN sys.dm_db_index_physical_stats(DB_ID(), OBJECT_ID('dbo.ov_shopfloorctl'), NULL, NULL, 'DETAILED') ps 
+    ON i.object_id = ps.object_id AND i.index_id = ps.index_id
+WHERE i.type_desc = 'NONCLUSTERED'
+    AND ps.page_count > 100  -- Solo indici con più di 100 pagine
+ORDER BY ps.avg_fragmentation_in_percent DESC;
+
+-- ===================================================================
+-- 4. REPORT RIASSUNTIVO PER DECISIONI
+-- ===================================================================
+
+WITH IndexAnalysis AS (
+    SELECT 
+        i.name AS IndexName,
+        ISNULL(s.user_seeks, 0) + ISNULL(s.user_scans, 0) + ISNULL(s.user_lookups, 0) AS TotalReads,
+        ISNULL(s.user_updates, 0) AS TotalWrites,
+        CAST((ps.avg_record_size_in_bytes * ps.record_count) / 1024.0 / 1024.0 AS DECIMAL(10,2)) AS SizeMB,
+        ps.avg_fragmentation_in_percent AS Fragmentation,
+        DATEDIFF(DAY, COALESCE(s.last_user_seek, s.last_user_scan, s.last_user_lookup, '1900-01-01'), GETDATE()) AS DaysSinceLastUse
+    FROM sys.indexes i
+    LEFT JOIN sys.dm_db_index_usage_stats s ON i.object_id = s.object_id AND i.index_id = s.index_id AND s.database_id = DB_ID()
+    LEFT JOIN sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, 'SAMPLED') ps ON i.object_id = ps.object_id AND i.index_id = ps.index_id
+    WHERE i.object_id = OBJECT_ID('dbo.ov_shopfloorctl')
+        AND i.type_desc = 'NONCLUSTERED'
+        AND i.is_disabled = 0
+)
+SELECT 
+    IndexName,
+    TotalReads,
+    TotalWrites,
+    SizeMB,
+    CAST(Fragmentation AS DECIMAL(5,2)) AS FragmentationPct,
+    DaysSinceLastUse,
+    -- Raccomandazione finale
+    CASE 
+        WHEN TotalReads = 0 AND DaysSinceLastUse > 30 THEN 'DROP - Unused > 30 days'
+        WHEN TotalWrites > TotalReads * 10 AND TotalReads < 100 THEN 'DROP - High maintenance, low benefit'
+        WHEN Fragmentation > 30 THEN 'REBUILD - High fragmentation'
+        WHEN Fragmentation > 10 THEN 'REORGANIZE - Medium fragmentation'
+        WHEN TotalReads > 1000 THEN 'KEEP - High usage'
+        WHEN SizeMB > 100 AND TotalReads < 10 THEN 'REVIEW - Large but low usage'
+        ELSE 'KEEP - Normal usage'
+    END AS Recommendation,
+    -- Priorità di azione
+    CASE 
+        WHEN TotalReads = 0 AND DaysSinceLastUse > 30 THEN 1
+        WHEN TotalWrites > TotalReads * 10 AND TotalReads < 100 THEN 2
+        WHEN Fragmentation > 30 THEN 3
+        WHEN SizeMB > 100 AND TotalReads < 10 THEN 4
+        ELSE 5
+    END AS ActionPriority
+FROM IndexAnalysis
+ORDER BY ActionPriority, SizeMB DESC;
+
+-- ===================================================================
+-- 5. SCRIPT PER RESET STATISTICHE (SE NECESSARIO)
+-- ===================================================================
+
+-- ATTENZIONE: Questo reset cancellerà tutte le statistiche di utilizzo!
+-- Utilizzare solo se si vuole iniziare un nuovo periodo di monitoraggio
+
+/*
+-- Uncomment per eseguire il reset
+EXEC sp_helpdb; -- Verifica stato database
+-- Riavvio necessario del servizio SQL Server o rimozione/ricreazione degli indici
+-- per resettare completamente le statistiche dm_db_index_usage_stats
+
+
+
+
+
+*/
+
+-- ===================================================================
+-- 6. MONITORAGGIO CONTINUO (Query da salvare come JOB)
+-- ===================================================================
+
+-- Script da eseguire settimanalmente per tracking
+INSERT INTO IndexMonitoringLog  -- Creare questa tabella per storico
+SELECT 
+    GETDATE() AS ScanDate,
+    DB_NAME() AS DatabaseName,
+    'ov_shopfloorctl' AS TableName,
+    i.name AS IndexName,
+    ISNULL(s.user_seeks, 0) AS UserSeeks,
+    ISNULL(s.user_scans, 0) AS UserScans,
+    ISNULL(s.user_lookups, 0) AS UserLookups,
+    ISNULL(s.user_updates, 0) AS UserUpdates
+FROM sys.indexes i
+LEFT JOIN sys.dm_db_index_usage_stats s ON i.object_id = s.object_id AND i.index_id = s.index_id AND s.database_id = DB_ID()
+WHERE i.object_id = OBJECT_ID('dbo.ov_shopfloorctl')
+    AND i.type_desc = 'NONCLUSTERED';
+
+-- ===================================================================
+-- COME INTERPRETARE I RISULTATI:
+--
+-- 1. UserSeeks: Ricerche specifiche (WHERE col = valore) - BUONO
+-- 2. UserScans: Scansioni complete dell'indice - OK se necessarie
+-- 3. UserLookups: Ricerche con key lookup aggiuntivi - COSTOSO
+-- 4. UserUpdates: Operazioni di manutenzione indice - COSTO
+--
+-- RATIO IDEALI:
+-- - Reads/Writes > 10:1 = Indice molto utile
+-- - Reads/Writes 3:1 to 10:1 = Indice utile
+-- - Reads/Writes < 3:1 = Questionabile
+-- - Solo Writes = Candidato per rimozione
+--
+-- FRAGMENTATION:
+-- - < 10% = OK
+-- - 10-30% = REORGANIZE
+-- - > 30% = REBUILD
+-- ===================================================================
